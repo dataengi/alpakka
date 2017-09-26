@@ -4,7 +4,7 @@
 package akka.stream.alpakka.cassandra
 
 import akka.actor.{ActorSystem, Cancellable}
-import akka.stream.stage.{AsyncCallback, GraphStage, GraphStageLogic, OutHandler}
+import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
 import com.datastax.driver.core.exceptions.NoHostAvailableException
 import com.datastax.driver.core.querybuilder.Select
@@ -52,19 +52,17 @@ final class CassandraRereadableSourceStage[KEY](afterId: KEY,
   override val shape: SourceShape[Row] = SourceShape(out)
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new GraphStageLogic(shape) {
+    new TimerGraphStageLogic(shape) with OutHandler {
 
       private var maybeResultSet = Option.empty[ResultSet]
-      private var futFetchedCallback: AsyncCallback[Try[ResultSet]] = _
+      private lazy val futFetchedCallback: AsyncCallback[Try[ResultSet]] =
+        getAsyncCallback[Try[ResultSet]](tryPushAfterFetch)
       private var lastSelectId: KEY = afterId
       private var lastRunningWithDelay: Option[Cancellable] = None
 
       private def runWithDelay(delay: FiniteDuration)(f: => Unit): Unit = {
-        if (lastRunningWithDelay.nonEmpty) {
-          lastRunningWithDelay.foreach(_.cancel())
-        }
-
-        schedulerOnce(delay, f)
+        lastRunningWithDelay.foreach(_.cancel()) // cancel last callback
+        schedulerOnce(delay, f) // add new callback
       }
 
       private def schedulerOnce(delay: FiniteDuration, f: => Unit): Unit = {
@@ -77,36 +75,28 @@ final class CassandraRereadableSourceStage[KEY](afterId: KEY,
       }
 
       override def preStart(): Unit = {
-        futFetchedCallback = getAsyncCallback[Try[ResultSet]](tryPushAfterFetch)
         selectMore()
       }
 
-      setHandler(
-        out,
-        new OutHandler {
-          override def onPull(): Unit = {
-            implicit val ec: ExecutionContextExecutor = materializer.executionContext
+      override def onPull(): Unit = {
+        implicit val ec: ExecutionContextExecutor = materializer.executionContext
 
-            maybeResultSet match {
-              case Some(resultSet) if resultSet.getAvailableWithoutFetching > 0 =>
-                pushOne(resultSet)
+        maybeResultSet match {
+          case Some(resultSet) if resultSet.getAvailableWithoutFetching > 0 =>
+            pushOne(resultSet)
 
-              case Some(rs) if rs.isExhausted =>
-                selectMore()
+          case Some(rs) if rs.isExhausted =>
+            selectMore()
 
-              case Some(rs) =>
-                val futureResultSet = rs.fetchMoreResults().asScala()
-                futureResultSet.onComplete(futFetchedCallback.invoke)
-              case None => () // doing nothing, waiting for futRs in preStart() to be completed
-            }
-          }
+          case Some(rs) =>
+            val futureResultSet = rs.fetchMoreResults().asScala()
+            futureResultSet.onComplete(futFetchedCallback.invoke)
+          case None => () // doing nothing, waiting for futRs in preStart() to be completed
         }
-      )
+      }
 
       override def postStop(): Unit = {
-        if (lastRunningWithDelay.nonEmpty) {
-          lastRunningWithDelay.foreach(_.cancel())
-        }
+        lastRunningWithDelay.foreach(_.cancel())
         super.postStop()
       }
 
@@ -152,5 +142,7 @@ final class CassandraRereadableSourceStage[KEY](afterId: KEY,
         } else {
           runWithDelay(pollInterval)(pushOne(resultSet))
         }
+
+      setHandler(out, this)
     }
 }
